@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=70.0"] 
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poly-mcp-client"
+version = "0.0.1"
+description = "An MCP client adapting tool definitions for Anthropic, OpenAI, and Gemini."
+readme = "README.md"
+authors = [
+    { name = "yo-ban" },
+]
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Communications",
+]
+keywords = ["mcp", "model context protocol", "client", "manager", "ai", "llm"]
+
+# 必須の依存関係
+dependencies = [
+    "mcp == 1.6.0",
+    "pydantic == 2.11.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/yo-ban/poly-mcp-client"
+Repository = "https://github.com/yo-ban/poly-mcp-client.git"
+
+# (オプション) 開発やテスト用の依存関係
+# [project.optional-dependencies]
+# dev = [
+#     "pytest >= 7.0",
+#     "pytest-asyncio", # 非同期テスト用
+#     "mypy >= 1.0",    # 型チェック
+#     "ruff",           # リンター & フォーマッター
+#     # "black",          # フォーマッター (ruffに統合可能)
+#     "types-setuptools", # setuptoolsの型ヒント
+# ]
+# docs = [
+#     "sphinx >= 6.0",
+#     "sphinx-rtd-theme", # ドキュメントテーマの例
+# ]
+
+# setuptools 固有の設定 (srcレイアウトを使う場合)
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88 # Black互換
+select = ["E", "W", "F", "I", "UP", "PL", "PYI"]
+ignore = ["E501"] # line-lengthで制御するため無視
+
+[tool.ruff.lint]
+# select/ignore はここに書くことも可能
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+strict = true
+packages = ["poly_mcp_client"]
+# ignore_missing_imports = true
+
