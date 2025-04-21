@@ -28,7 +28,7 @@ keywords = ["mcp", "model context protocol", "client", "manager", "ai", "llm"]
 # 必須の依存関係
 dependencies = [
     "mcp == 1.6.0",
-    "pydantic == 2.11.3",
+    "pydantic >= 2.10.6",
 ]
 
 [project.urls]
