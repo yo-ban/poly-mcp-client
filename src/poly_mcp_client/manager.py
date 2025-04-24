@@ -2,7 +2,7 @@
 import asyncio
 import json
 from contextlib import AsyncExitStack
-from typing import Dict, List, Any, Optional, Literal, Tuple
+from typing import Dict, List, Any, Optional, Literal, Tuple, Set
 import logging
 from pydantic import ValidationError
 
@@ -20,7 +20,8 @@ from .models import (
     McpServersConfig, 
     InternalServerDefinition, 
     CanonicalToolParameter, 
-    CanonicalToolDefinition
+    CanonicalToolDefinition,
+    ServerConfig 
 )
 
 # --- ロギング設定 ---
@@ -39,12 +40,103 @@ class PolyMCPClient:
         self._is_shutting_down = False
         self._mcp_prefix = mcp_prefix
 
+    def _parse_and_validate_config(
+        self,
+        config_data: Optional[Dict[str, Any]],
+        context: str = "operation" # "initialization" or "update"
+    ) -> Optional[Dict[str, InternalServerDefinition]]:
+        """設定データをパース・バリデーションし、内部定義の辞書を返す。エラー時は None を返す。"""
+        servers_dict_data: Optional[Dict] = None
+        if config_data and isinstance(config_data, dict) and "mcpServers" in config_data and isinstance(config_data.get("mcpServers"), dict):
+            servers_dict_data = config_data["mcpServers"]
+        elif config_data: # config_data はあるが形式が不正
+            logger.error(f"Invalid configuration data for {context}. Top level must contain 'mcpServers' object.")
+            return None
+        # config_data が None の場合は空の辞書を処理対象とする
+
+        new_definitions: Dict[str, InternalServerDefinition] = {}
+        try:
+            # servers_dict_data が None の場合は空の辞書を渡す
+            parsed_servers = McpServersConfig.model_validate(servers_dict_data or {})
+            for server_name, server_config in parsed_servers.root.items():
+                internal_def = InternalServerDefinition(
+                    name=server_name,
+                    type=server_config.type,
+                    config=server_config
+                )
+                new_definitions[server_name] = internal_def
+            logger.info(f"{len(new_definitions)} MCP server configurations validated successfully for {context}.")
+            return new_definitions
+        except ValidationError as e:
+            logger.error(f"MCP server configuration validation error during {context}:\n{e}")
+            return None # バリデーションエラー時は None
+        except Exception as e:
+            logger.error(f"Unexpected error during configuration parsing for {context}: {e}", exc_info=True)
+            return None # その他のエラー時も None
+
+    async def _reconcile_connections(
+        self,
+        new_definitions: Dict[str, InternalServerDefinition],
+        is_initialization: bool = False
+    ):
+        """現在の接続状態を新しい定義に合わせて調整（開始/停止）する。"""
+        current_server_names = set(self._server_definitions.keys())
+        new_server_names = set(new_definitions.keys())
+
+        servers_to_remove = current_server_names - new_server_names
+        servers_to_add = new_server_names - current_server_names
+        servers_to_check_update = current_server_names.intersection(new_server_names)
+
+        servers_to_update: Set[str] = set()
+        for name in servers_to_check_update:
+            # is_initialization が True の場合、既存の定義はないので比較しない
+            # (self._server_definitions は initialize の冒頭でクリアされる想定だが念のため)
+            if not is_initialization and name in self._server_definitions and self._server_definitions[name].config != new_definitions[name].config:
+                servers_to_update.add(name)
+
+        context = "initialization" if is_initialization else "update"
+        logger.info(f"Connection Reconciliation ({context}) - Remove: {list(servers_to_remove)}, Add: {list(servers_to_add)}, Update: {list(servers_to_update)}")
+
+        # --- 既存接続の停止 (削除・更新対象) ---
+        servers_to_stop = servers_to_remove.union(servers_to_update)
+        if servers_to_stop:
+            logger.info(f"Stopping connections for servers: {list(servers_to_stop)}")
+            stop_tasks = [self._stop_connection(name, reason=f"configuration {context}") for name in servers_to_stop]
+            await asyncio.gather(*stop_tasks, return_exceptions=True) # エラーは無視しないが続行
+            logger.info(f"Finished stopping connections for {len(servers_to_stop)} servers.")
+        else:
+            logger.info("No servers need to be stopped.")
+
+        # --- 新規接続の開始 (追加・更新対象) ---
+        servers_to_start = servers_to_add.union(servers_to_update)
+        if servers_to_start:
+            logger.info(f"Starting connections for servers: {list(servers_to_start)}")
+            for name in servers_to_start:
+                definition = new_definitions[name]
+                # 新しい接続 or 更新なので、新しい Future を作成または取得
+                # initialize の場合、Future は既に親の initialize で作成・クリアされている
+                # update の場合、ここで作成する
+                if name not in self._initial_connection_futures or self._initial_connection_futures[name].done():
+                    self._initial_connection_futures[name] = asyncio.Future()
+
+                future = self._initial_connection_futures[name]
+                self._server_definitions[name] = definition # 内部定義を更新/追加
+                self._start_connection(name, definition, future) # タスク開始 (start_tasks 配列は不要)
+
+            logger.info(f"Initiated starting connections for {len(servers_to_start)} servers.")
+        else:
+            logger.info("No new servers need to be started.")
+
+        # --- 内部定義の最終調整 (削除されたサーバー定義を確実に消す) ---
+        # _stop_connection で定義は削除されるが、念のため新しい定義セットで上書き
+        self._server_definitions = {name: definition for name, definition in new_definitions.items()}
+
+        logger.info(f"Connection reconciliation complete ({context}).")
+        logger.info(f"Active server definitions: {list(self._server_definitions.keys())}")
+
+
     async def initialize(self, config_path: Optional[str] = None, config_data: Optional[Dict[str, Any]] = None):
-        """
-        指定された設定ファイルまたはデータからMCPサーバー接続を初期化する。
-        config_path が指定された場合はファイルを読み込む。
-        config_data が指定された場合は、{"mcpServers": {"server_key": {...}, ...}} の形式を期待する。
-        """
+        """指定された設定ファイルまたはデータからMCPサーバー接続を初期化する。"""
         async with self._lock:
             if self._is_initialized:
                 logger.warning("MCPClientManager is already initialized.")
@@ -54,127 +146,131 @@ class PolyMCPClient:
                 return
 
             logger.info("MCPClientManager is initializing...")
-            servers_dict_data: Optional[Dict] = None
+
+            # --- 設定の読み込み ---
+            raw_config_data_dict: Optional[Dict[str, Any]] = None # config_data を受け取る変数
             if config_path:
-                logger.info(f"Loading configuration file {config_path}...")
                 try:
                     with open(config_path, 'r', encoding='utf-8') as f:
-                        raw_config_data = json.load(f)
-                    # ファイルから読み込んだ場合、mcpServers キーをチェック
-                    if "mcpServers" not in raw_config_data or not isinstance(raw_config_data.get("mcpServers"), dict):
-                        logger.error(f"Invalid configuration file {config_path}. Top level must contain 'mcpServers' object.")
-                        return
-                    servers_dict_data = raw_config_data["mcpServers"] # 辞書の中身を取得
-
+                        raw_config_data_dict = json.load(f)
                 except FileNotFoundError:
                     logger.error(f"Configuration file not found: {config_path}")
                     return
                 except json.JSONDecodeError as e:
                     logger.error(f"JSON parsing error in configuration file: {e}")
                     return
-
             elif config_data:
-                logger.info("Using provided configuration data.")
-
-                if isinstance(config_data, dict) and "mcpServers" in config_data and isinstance(config_data.get("mcpServers"), dict):
-                    servers_dict_data = config_data["mcpServers"]
-                else:
-                    logger.error("Invalid configuration data. Top level must contain 'mcpServers' object.")
-                    return
+                raw_config_data_dict = config_data
             else:
                 logger.warning("No configuration file path or data provided. Skipping initialization.")
-                return
-            
-            if not servers_dict_data:
-                logger.info("No server configurations provided. No servers will be connected.")
-                self._is_initialized = True  # 空でも初期化は完了
+                # 空でも初期化は完了とする
+                self._is_initialized = True
                 return
 
-            # --- Pydantic 検証 ---
+            # --- 設定のパースとバリデーション ---
+            new_definitions = self._parse_and_validate_config(raw_config_data_dict, context="initialization")
+
+            if new_definitions is None: # パース/バリデーションエラー
+                # ログは _parse_and_validate_config 内で出力済み
+                return
+
+            # --- 接続前の状態クリア ---
+            # initialize では既存の接続はないはずだが、念のためクリア
+            # (update と異なり、既存タスク停止は不要)
             self._server_definitions.clear()
-            self._initial_connection_futures.clear()
-            validated_count = 0
-            try:
-                # McpServersConfig を使用して辞書全体を検証
-                parsed_servers = McpServersConfig.model_validate(servers_dict_data)
+            self._connection_tasks.clear() # 既存タスクは考慮しない
+            self._sessions.clear()
+            self._server_capabilities.clear()
+            self._initial_connection_futures.clear() # Future もクリア
 
-                for server_name, server_config in parsed_servers.root.items():
-                    # ServerConfig は Union なので、type で分岐する必要はない
-                    internal_def = InternalServerDefinition(
-                        name=server_name,
-                        type=server_config.type,  # type は StdioServerConfig/HttpServerConfig に含まれる
-                        config=server_config
-                    )
-                    self._server_definitions[server_name] = internal_def
-                    self._initial_connection_futures[server_name] = asyncio.Future()
-                    validated_count += 1
-                logger.info(f"{validated_count} MCP server configurations validated successfully.")
+            # --- 新しい Future を準備 ---
+            for name in new_definitions.keys():
+                self._initial_connection_futures[name] = asyncio.Future()
 
-            except ValidationError as e:
-                logger.error(f"MCP server configuration validation error:\n{e}")
-                # エラー発生時、Futureをキャンセルまたはエラー状態にする
-                for name in self._server_definitions:
-                    if name in self._initial_connection_futures and not self._initial_connection_futures[name].done():
-                        self._initial_connection_futures[name].set_exception(e)
-                self._server_definitions.clear() # エラーがあったら定義もクリア
-                return
-
-            # 接続タスク開始
-            for name, definition in self._server_definitions.items():
-                # Future を接続タスクに渡す
-                self._start_connection(name, definition, self._initial_connection_futures[name])
+            # --- 接続調整 (実質、全サーバー追加) ---
+            await self._reconcile_connections(new_definitions, is_initialization=True)
 
             self._is_initialized = True
             logger.info("MCPClientManager initialization complete. Connections will be attempted in the background.")
             logger.info("To wait for initial connections, call await manager.wait_for_initial_connections()")
 
+
     async def wait_for_initial_connections(self, timeout: Optional[float] = None) -> Dict[str, Tuple[bool, Optional[Exception]]]:
         """
-        initializeで開始された全てのサーバーへの初期接続試行が完了するまで待機する。
-
-        Args:
-            timeout: 全体の待機タイムアウト時間 (秒)。Noneの場合は無制限。
-
-        Returns:
-            サーバー名をキーとし、(接続成功フラグ, 例外) のタプルを値とする辞書。
-            接続成功フラグが False の場合、例外オブジェクトが含まれる。
+        initializeまたはupdate_configurationで開始/再開されたサーバーへの
+        接続試行が完了するまで待機する。
+        (コメントを修正、ロジック変更なし)
         """
-        if not self._is_initialized and not self._server_definitions:
+        if not self._is_initialized and not self._server_definitions: # server_definitions もチェック
             logger.warning("Manager is not initialized or no servers are configured.")
             return {}
 
-        futures = list(self._initial_connection_futures.values())
-        if not futures:
-            logger.info("No initial connection futures to wait for.")
-            return {}
+        # 完了していない Future のみを待機対象とする方が効率的かもしれないが、
+        # 現状は辞書にあるもの全てを待つ
+        futures_to_wait = [
+            f for f in self._initial_connection_futures.values() if not f.done()
+        ]
+        # futures = list(self._initial_connection_futures.values()) # 以前の実装
+        if not futures_to_wait:
+            logger.info("No pending initial connection futures to wait for.")
+            # 既に完了しているFutureの結果も含めて返す (オプション)
+            results: Dict[str, Tuple[bool, Optional[Exception]]] = {}
+            for name, fut in self._initial_connection_futures.items():
+                try:
+                    result = fut.result() # Raises exception if future has error
+                    results[name] = (True, None)
+                except asyncio.CancelledError:
+                    results[name] = (False, asyncio.CancelledError(f"Connection for '{name}' was cancelled."))
+                except Exception as e:
+                    results[name] = (False, e)
+            return results
+            # return {} # 待機対象がなければ空を返すシンプルな実装
 
-        logger.info(f"{len(futures)} servers to wait for initial connection (timeout: {timeout}s)...")
+        logger.info(f"{len(futures_to_wait)} servers to wait for connection (timeout: {timeout}s)...")
 
-        done, pending = await asyncio.wait(futures, timeout=timeout, return_when=asyncio.ALL_COMPLETED)
+        done, pending = await asyncio.wait(futures_to_wait, timeout=timeout, return_when=asyncio.ALL_COMPLETED)
 
         results: Dict[str, Tuple[bool, Optional[Exception]]] = {}
         server_name_map = {f: name for name, f in self._initial_connection_futures.items()}
 
+        # Fill results from completed futures (done set)
         for fut in done:
             server_name = server_name_map.get(fut, "Unknown")
             try:
-                result = fut.result() # 結果を取得 (成功ならTrue、失敗なら例外がraiseされる)
+                result = fut.result()
                 results[server_name] = (True, None)
-                logger.info(f"Server '{server_name}' initial connection successful.")
+                logger.info(f"Server '{server_name}' connection successful or already completed.")
+            except asyncio.CancelledError:
+                results[server_name] = (False, asyncio.CancelledError(f"Initial connection for '{server_name}' was cancelled."))
+                logger.warning(f"Server '{server_name}' initial connection cancelled.")
             except Exception as e:
                 results[server_name] = (False, e)
                 logger.error(f"Server '{server_name}' initial connection error: {e}", exc_info=False)
 
+        # Handle pending futures (timeout)
         if pending:
-            logger.warning(f"Timeout ({timeout}s) reached. Some initial connections did not complete: {len(pending)}")
+            logger.warning(f"Timeout ({timeout}s) reached. Some connections did not complete: {len(pending)}")
             for fut in pending:
                 server_name = server_name_map.get(fut, "Unknown")
-                # Futureをキャンセルしてリソースリークを防ぐ試み
-                fut.cancel()
+                # Do not cancel the future here, let the connection attempt continue
+                # fut.cancel() # 削除
                 results[server_name] = (False, asyncio.TimeoutError(f"Initial connection timed out after {timeout}s"))
+
+        # Include results for futures that might have completed before the wait started
+        for name, fut in self._initial_connection_futures.items():
+            if name not in results and fut.done(): # まだ結果に含まれていない完了済みFuture
+                try:
+                    result = fut.result()
+                    results[name] = (True, None)
+                except asyncio.CancelledError:
+                    results[name] = (False, asyncio.CancelledError(f"Connection for '{name}' was cancelled."))
+                except Exception as e:
+                    results[name] = (False, e)
+
 
         logger.info("Initial connection wait complete.")
         return results
+
 
     def _start_connection(self, name: str, definition: InternalServerDefinition, initial_conn_future: asyncio.Future) -> Optional[asyncio.Task]:
         """個別のサーバーへの接続タスクを作成し、管理する"""
@@ -204,15 +300,98 @@ class PolyMCPClient:
         )
         return task
 
+    async def _stop_connection(self, server_name: str, reason: str = "stopping connection"):
+        """指定されたサーバーの接続監視タスクを停止し、関連データをクリーンアップする"""
+        logger.info(f"Stopping connection for server '{server_name}' ({reason})...")
+
+        # 1. タスクを取得してキャンセル
+        task = self._connection_tasks.pop(server_name, None)
+        if task and not task.done():
+            logger.debug(f"Cancelling connection task for server '{server_name}'...")
+            task.cancel()
+            try:
+                # タスクの完了 (キャンセル含む) を待つ (タイムアウトを設定)
+                await asyncio.wait_for(task, timeout=10.0)
+                logger.info(f"Connection task for server '{server_name}' cancelled successfully.")
+            except asyncio.CancelledError:
+                logger.info(f"Connection task for server '{server_name}' cancellation confirmed.")
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout waiting for connection task cancellation of server '{server_name}'.")
+            except Exception as e:
+                logger.error(f"Error during connection task cancellation for server '{server_name}': {e}", exc_info=False)
+        elif task and task.done():
+            logger.debug(f"Connection task for server '{server_name}' was already done.")
+        else:
+            logger.debug(f"No active connection task found for server '{server_name}'.")
+
+
+        # 2. 内部状態から削除 (タスクの finally ブロックでも削除されるが、念のため)
+        #    ロックの外で実行される想定なので、pop を使う
+        self._sessions.pop(server_name, None)
+        self._server_capabilities.pop(server_name, None)
+        definition = self._server_definitions.pop(server_name, None) # 定義も削除
+        future = self._initial_connection_futures.pop(server_name, None)
+
+        # 3. 初期接続 Future があればキャンセル (完了していなければ)
+        if future and not future.done():
+            future.cancel()
+
+        if definition:
+            logger.info(f"Stopped and cleaned up server '{server_name}' ({definition.type}).")
+        else:
+            logger.info(f"Cleaned up internal state for server '{server_name}' (definition not found).")
+
+
+    async def update_configuration(self, config_path: Optional[str] = None, config_data: Optional[Dict[str, Any]] = None):
+        """現在のMCPサーバー接続設定を、指定された設定ファイルまたはデータから更新する。"""
+        async with self._lock:
+            if self._is_shutting_down:
+                logger.warning("Manager is shutting down. Cannot update configuration.")
+                return
+            if not self._is_initialized:
+                logger.warning("Manager is not initialized. Cannot update configuration. Call initialize first.")
+                return
+
+            # --- 設定の読み込み ---
+            raw_config_data_dict: Optional[Dict[str, Any]] = None # config_data を受け取る変数
+            if config_path:
+                try:
+                    with open(config_path, 'r', encoding='utf-8') as f:
+                        raw_config_data_dict = json.load(f)
+                except FileNotFoundError:
+                    logger.error(f"Configuration file not found: {config_path}")
+                    return
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON parsing error in configuration file: {e}")
+                    return
+            elif config_data:
+                raw_config_data_dict = config_data
+            else:
+                logger.warning("No configuration file path or data provided. Using empty configuration.")
+                raw_config_data_dict = {}
+
+
+            logger.info("Updating MCP server configuration...")
+
+            # --- 設定のパースとバリデーション ---
+            new_definitions = self._parse_and_validate_config(raw_config_data_dict, context="update")
+
+            if new_definitions is None: # パース/バリデーションエラー
+                return
+
+            # --- 接続調整 ---
+            await self._reconcile_connections(new_definitions, is_initialization=False)
+
+
     async def _connect_and_monitor(self, name: str, definition: InternalServerDefinition, initial_conn_future: asyncio.Future):
         """サーバーへの接続、セッション確立、プロセス監視を行うコルーチン (Futureを引数に追加)"""
         retry_delay = 5
         max_retry_delay = 60
         initial_attempt = True # 最初の接続試行かどうかを追跡
+        exit_stack = AsyncExitStack()
 
         while not self._is_shutting_down:  # 初期化フラグではなくシャットダウンフラグを見る
             session = None
-            exit_stack = AsyncExitStack()
             capabilities = None  # ループ内でリセット
             connection_error = None # 初期接続エラー保持用
 
@@ -350,7 +529,7 @@ class PolyMCPClient:
                 # initial_attempt フラグは finally で False にする
             except asyncio.CancelledError:
                 logger.info(f"Connection task for server '{name}' was cancelled.")
-                connection_error = asyncio.CancelledError() # キャンセルも記録
+                connection_error = asyncio.CancelledError("Task cancelled")  # キャンセルも記録
                 break # キャンセルされたらループ終了
             except Exception as e:
                 connection_error = e # その他の予期せぬエラー
@@ -404,6 +583,12 @@ class PolyMCPClient:
             retry_delay = min(retry_delay * 2, max_retry_delay)
 
         logger.info(f"Connection and monitoring task for server '{name}' ({definition.type}) ended.")
+
+        try:
+            await exit_stack.aclose()
+            logger.debug(f"Cleaned up resource stack for server '{name}' at task end.")
+        except Exception as e_stack:
+            logger.error(f"Error cleaning up resource stack for server '{name}' at task end: {e_stack}")
 
         # タスク終了時に Future がまだ完了していなければ、エラー状態にする
         if not initial_conn_future.done():
@@ -941,32 +1126,27 @@ class PolyMCPClient:
             logger.info("Starting shutdown of MCP connections and processes...")
             self._is_initialized = False  # 新規初期化をブロック
             
+            # _stop_connection を使って各タスクを停止
+            tasks_to_stop = list(self._connection_tasks.keys()) # コピーを作成
+            stop_tasks = []
+            if tasks_to_stop:
+                logger.info(f"Stopping {len(tasks_to_stop)} active connections...")
+                for name in tasks_to_stop:
+                    stop_tasks.append(self._stop_connection(name, reason="shutdown"))
 
-            tasks_to_cancel = list(self._connection_tasks.values())
-            self._connection_tasks.clear()  # 早めにクリアして新規タスク追加を防ぐ
-
-            # 初期接続Futureもキャンセル状態にする
-            futures_to_cancel = list(self._initial_connection_futures.values())
-            self._initial_connection_futures.clear()
-            for fut in futures_to_cancel:
-                if not fut.done():
-                    fut.cancel()
-
-            if tasks_to_cancel:
-                for task in tasks_to_cancel:
-                    if not task.done():
-                        task.cancel()
-                results = await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-                cancelled_count = sum(1 for r in results if isinstance(r, asyncio.CancelledError))
-                error_count = sum(1 for r in results if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError))
-                logger.info(f"{len(tasks_to_cancel)} connections/monitoring tasks completed. (Cancelled: {cancelled_count}, Errors: {error_count})")
+                results = await asyncio.gather(*stop_tasks, return_exceptions=True)
+                stopped_count = len(results)
+                error_count = sum(1 for r in results if isinstance(r, Exception))
+                logger.info(f"{stopped_count} connection stop routines completed. (Errors: {error_count})")
             else:
-                logger.info("No tasks to cancel.")
+                logger.info("No active connections to stop.")
 
-            # セッションとケイパビリティ情報をクリア (既に接続タスクのfinallyで削除されているはずだが念のため)
+            # _stop_connection 内でクリアされるが念のため
+            self._connection_tasks.clear()
             self._sessions.clear()
             self._server_capabilities.clear()
-            self._server_definitions.clear()  # 定義もクリア
+            self._server_definitions.clear()
+            self._initial_connection_futures.clear()
             await asyncio.sleep(0.5)
 
             logger.info("MCP connections and processes shutdown complete.")            
