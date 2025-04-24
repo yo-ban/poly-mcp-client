@@ -195,7 +195,7 @@ class PolyMCPClient:
             logger.info("To wait for initial connections, call await manager.wait_for_initial_connections()")
 
 
-    async def wait_for_initial_connections(self, timeout: Optional[float] = None) -> Dict[str, Tuple[bool, Optional[Exception]]]:
+    async def wait_for_connections(self, timeout: Optional[float] = None) -> Dict[str, Tuple[bool, Optional[Exception]]]:
         """
         initializeまたはupdate_configurationで開始/再開されたサーバーへの
         接続試行が完了するまで待機する。
