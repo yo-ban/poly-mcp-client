@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "poly-mcp-client"
-version = "0.0.1"
+version = "0.0.2"
 description = "An MCP client adapting tool definitions for Anthropic, OpenAI, and Gemini."
 readme = "README.md"
 authors = [
@@ -36,19 +36,20 @@ Homepage = "https://github.com/yo-ban/poly-mcp-client"
 Repository = "https://github.com/yo-ban/poly-mcp-client.git"
 
 # (オプション) 開発やテスト用の依存関係
-# [project.optional-dependencies]
-# dev = [
-#     "pytest >= 7.0",
-#     "pytest-asyncio", # 非同期テスト用
-#     "mypy >= 1.0",    # 型チェック
-#     "ruff",           # リンター & フォーマッター
-#     # "black",          # フォーマッター (ruffに統合可能)
-#     "types-setuptools", # setuptoolsの型ヒント
-# ]
-# docs = [
-#     "sphinx >= 6.0",
-#     "sphinx-rtd-theme", # ドキュメントテーマの例
-# ]
+[project.optional-dependencies]
+test = [
+    "pytest >= 7.0",
+    "pytest-asyncio >= 0.20", # 非同期テスト用
+    "pytest-mock >= 3.5",     # pytest 用の mocker フィクスチャ
+    "pytest-cov >= 3.0",      # コードカバレッジ計測用 (オプション)
+    # unittest.mock は Python 標準ライブラリに含まれるため、通常は不要
+]
+dev = [
+    "poly-mcp-client[test]", # test 依存関係を含む
+    "mypy >= 1.0",
+    "ruff",
+    "types-setuptools",
+]
 
 # setuptools 固有の設定 (srcレイアウトを使う場合)
 [tool.setuptools.packages.find]
@@ -74,3 +75,11 @@ strict = true
 packages = ["poly_mcp_client"]
 # ignore_missing_imports = true
 
+# pytest の設定
+[tool.pytest.ini_options]
+minversion = "6.0"
+testpaths = [
+    "tests", # テストファイルを探すディレクトリ
+]
+# addopts = "-ra -q" # pytest の実行オプション (例: -v で詳細表示、-s で print 表示)
+asyncio_mode = "auto" # pytest-asyncio にイベントループ管理を任せる

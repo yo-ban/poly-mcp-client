@@ -6,7 +6,7 @@ An MCP client adapting tool definitions for Anthropic, OpenAI, and Gemini.
 """
 
 # ライブラリのバージョン
-__version__ = "0.0.1" # 例: セマンティックバージョニングに従う
+__version__ = "0.0.2" # 例: セマンティックバージョニングに従う
 
 # 主要なクラスをインポートして公開
 from .manager import PolyMCPClient
