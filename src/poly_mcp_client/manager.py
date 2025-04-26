@@ -5,6 +5,7 @@ from contextlib import AsyncExitStack
 from typing import Dict, List, Any, Optional, Literal, Tuple, Set
 import logging
 from pydantic import ValidationError
+import time
 
 # MCP SDKのインポート
 from mcp import ClientSession, StdioServerParameters, McpError
@@ -23,6 +24,10 @@ from .models import (
     CanonicalToolDefinition,
     ServerConfig 
 )
+
+# --- Keep-Alive設定 ---
+PING_INTERVAL = 30.0  # Pingを送信する間隔（秒）
+PING_TIMEOUT = 10.0   # Ping応答のタイムアウト（秒）
 
 # --- ロギング設定 ---
 # ライブラリ利用者が設定することを想定
@@ -447,15 +452,14 @@ class PolyMCPClient:
 
                 elif definition.type == "http":
                     if not isinstance(definition.config, HttpServerConfig):
-                        logger.error(
-                            f"Invalid config type for http server: {name}")
+                        logger.error(f"Invalid config type for http server: {name}")
                         connection_error = TypeError("Invalid config type for http server.")
                         break
                     http_config = definition.config
                     server_url = http_config.url
-                    logger.info(
-                        f"Attempting connection to server '{name}' (http): {server_url}")
+                    logger.info(f"Attempting connection to server '{name}' (http): {server_url}")
 
+                    connection_established_in_this_loop = False
                     try:
                         # sse_client コンテキストマネージャを使用
                         # 認証ヘッダー等が必要な場合、sse_clientが引数で受け付けるか確認が必要
@@ -473,6 +477,7 @@ class PolyMCPClient:
                         if capabilities:
                             logger.info(f"Server '{name}' (http) capabilities: {capabilities}")
 
+                        connection_established_in_this_loop = True
                         retry_delay = 5
 
                     # HTTP/SSE 接続時のエラーハンドリング
@@ -495,24 +500,79 @@ class PolyMCPClient:
                         connection_error = e
                         break # 回復不能かもしれないのでループを抜ける
 
-                    # 接続成功時の処理
-                    if session and not connection_error:
+                    # 接続成功 -> Pingループ開始
+                    if connection_established_in_this_loop and session:
+                        # 初期接続Future設定 (元のコードと同じ)
                         if initial_attempt and not initial_conn_future.done():
                             initial_conn_future.set_result(True)
                         initial_attempt = False
 
-                        # --- 接続維持ループ (http/sse) ---
-                        while not self._is_shutting_down and name in self._sessions:
-                            # TODO: SSE接続の状態を確認する方法があれば追加
-                            # sse_client や ClientSession が切断を検知する仕組みがあるか？
-                            # なければ定期的なpingなどで確認する必要があるかもしれない
-                            await asyncio.sleep(5)
+                        # --- Keep-Alive Loop (HTTP/SSE with Ping) ---
+                        logger.info(f"Starting keep-alive ping loop for server '{name}' (http). Interval: {PING_INTERVAL}s")
+                        last_ping_time = time.monotonic() # Keep track of last successful ping or connection time
 
+                        while not self._is_shutting_down and name in self._sessions:
+                            current_session = self._sessions.get(name)
+                            if not current_session:
+                                logger.warning(f"Session object for '{name}' missing during ping loop.")
+                                connection_error = RuntimeError("Session object missing")
+                                break # Exit inner loop
+
+                            try:
+                                # Wait until next ping time or shutdown/removal
+                                time_since_last_ping = time.monotonic() - last_ping_time
+                                wait_time = max(0, PING_INTERVAL - time_since_last_ping)
+                                logger.debug(f"[{name}] Waiting {wait_time:.1f}s for next ping...")
+
+                                # Sleep for the calculated wait time, but check for shutdown periodically
+                                sleep_task = asyncio.create_task(asyncio.sleep(wait_time))
+                                done, pending = await asyncio.wait({sleep_task}, return_when=asyncio.FIRST_COMPLETED)
+
+                                # Check if shutdown/removal happened during sleep
+                                if self._is_shutting_down:
+                                    logger.info(f"Shutdown requested during ping interval for server '{name}'.")
+                                    sleep_task.cancel() # Cancel the sleep task if still pending
+                                    break # Exit inner loop
+                                if name not in self._sessions:
+                                    logger.warning(f"Server '{name}' removed during ping interval.")
+                                    sleep_task.cancel()
+                                    break # Exit inner loop
+
+                                # --- Send Ping ---
+                                logger.debug(f"Sending MCP ping to server '{name}' (http).")
+                                await asyncio.wait_for(current_session.ping(), timeout=PING_TIMEOUT)
+                                last_ping_time = time.monotonic() # Update time after successful ping
+                                logger.debug(f"MCP ping to server '{name}' (http) successful.")
+
+                            except asyncio.TimeoutError:
+                                logger.warning(f"MCP ping to server '{name}' (http) timed out after {PING_TIMEOUT}s. Assuming connection lost.")
+                                connection_error = asyncio.TimeoutError("Ping timeout")
+                                break # Exit inner loop to trigger reconnection
+                            except (McpError, ConnectionError, AttributeError, httpx.TransportError) as e: # Added httpx.TransportError
+                                logger.error(f"Error during MCP ping to server '{name}' (http): {type(e).__name__}: {e}. Assuming connection lost.", exc_info=False)
+                                connection_error = e # Record the error
+                                break # Exit inner loop to trigger reconnection
+                            except asyncio.CancelledError:
+                                logger.info(f"Ping loop cancelled for server '{name}'.")
+                                connection_error = asyncio.CancelledError("Ping loop cancelled")
+                                break # Exit inner loop and outer loop
+                            except Exception as e: # Catch unexpected errors during ping loop
+                                logger.error(f"Unexpected error in ping loop for server '{name}': {e}", exc_info=True)
+                                connection_error = e
+                                break # Exit inner loop
+
+                        # --- End of Keep-Alive Loop ---
                         if self._is_shutting_down:
                             logger.info(f"Shutdown requested. Stopping monitoring of server '{name}' (http).")
-                            break
-                        logger.warning(f"Connection to server '{name}' (http) lost.")
-                        # 接続が失われた場合はループの最後でリトライされる
+                            break # Exit outer loop
+                        elif name not in self._sessions:
+                            logger.info(f"Server '{name}' was removed during ping loop. Stopping monitoring task.")
+                            break # Exit outer loop
+                        else:
+                            # Inner loop broken due to error (ping failure/timeout/other exception)
+                            logger.warning(f"Keep-alive loop ended for server '{name}' (http). Reason: {type(connection_error).__name__ if connection_error else 'Unknown'}. Attempting reconnect.")
+                            # Let the outer loop handle retry logic
+
                     else:
                         # 接続に失敗した場合 (connection_error が設定されているはず)
                         # ループの最後でリトライされる
@@ -522,7 +582,7 @@ class PolyMCPClient:
                     logger.error(connection_error)
                     break
 
-            # --- 接続失敗時の処理 ---
+            # --- 接続エラー/ループ終了時の共通処理 ---
             except (ConnectionRefusedError, FileNotFoundError, asyncio.TimeoutError) as e:
                 connection_error = e # エラーを記録
                 logger.error(f"Failed to connect to server '{name}': {e}", exc_info=False)
@@ -536,42 +596,41 @@ class PolyMCPClient:
                 logger.error(f"Unexpected error occurred during connection or monitoring of server '{name}': {e}", exc_info=False)
                 # initial_attempt フラグは finally で False にする
             finally:
-                # 最初の試行でエラーが発生した場合、Futureを完了させる
+                # --- リソースクリーンアップ & Future処理 ---
                 if initial_attempt and not initial_conn_future.done():
-                    if connection_error:
-                        initial_conn_future.set_exception(connection_error)
+                    error_to_set = connection_error or RuntimeError(f"Initial connection attempt failed for '{name}'.")
+                    if isinstance(error_to_set, asyncio.CancelledError):
+                        initial_conn_future.cancel()
+                        logger.info(f"Initial connection future cancelled for '{name}'.")
                     else:
-                        # ここに来ることは稀だが、念のため
-                        initial_conn_future.set_exception(RuntimeError(f"Unknown initial connection state for server '{name}'."))
-                initial_attempt = False # 最初の試行はこれで完了
+                        initial_conn_future.set_exception(error_to_set)
+                        logger.warning(f"Initial connection future set to failed for '{name}': {error_to_set}")
+                initial_attempt = False
 
-                # セッションとケイパビリティ情報を削除
-                if name in self._sessions:
-                    del self._sessions[name]
-                    logger.debug(f"Deleted session info for server '{name}'.")
-                if name in self._server_capabilities:
-                    del self._server_capabilities[name]
-                    logger.debug(f"Deleted capability info for server '{name}'.")
+                # セッション/ケイパビリティ情報のクリーンアップ
+                self._sessions.pop(name, None)
+                self._server_capabilities.pop(name, None)
+                logger.debug(f"Cleaned session/capability state for server '{name}' after attempt/disconnection.")
 
-                # exit_stackでリソースをクリーンアップ
+                # ExitStackのクリーンアップ
                 try:
                     await exit_stack.aclose()
+                    exit_stack = AsyncExitStack() # 次の試行のために再初期化
                     logger.debug(f"Cleaned up resource stack for server '{name}'.")
                 except Exception as e_stack:
                     logger.error(f"Error cleaning up resource stack for server '{name}': {e_stack}")
 
                 if self._is_shutting_down:
                     logger.info(f"Shutdown in progress. Reconnection for server '{name}' will not be attempted.")
-                    break # シャットダウン中はループ終了
+                    break
 
             # 再接続ロジック (キャンセルされていない場合)
             # リトライすべきでないエラータイプの場合はループを抜ける
-            if connection_error and isinstance(connection_error, (TypeError, ValueError)):
-                logger.error(f"Server '{name}' ({definition.type}) is not recoverable due to configuration error. Error: {connection_error}")
+            if isinstance(connection_error, (TypeError, ValueError, NotImplementedError)):
+                logger.error(f"Unrecoverable error for server '{name}' ({definition.type}): {connection_error}. Stopping connection attempts.")
                 break
-            if connection_error and isinstance(connection_error, NotImplementedError): # HTTP未実装の場合など
-                logger.error(f"Server '{name}' ({definition.type}) is not implemented or supported. Reconnection will not be attempted.")
-                break
+            if isinstance(connection_error, asyncio.CancelledError):
+                break # キャンセルならリトライしない
 
             logger.info(f"Attempting reconnection to server '{name}' in {retry_delay} seconds...")
             try:
@@ -592,11 +651,12 @@ class PolyMCPClient:
 
         # タスク終了時に Future がまだ完了していなければ、エラー状態にする
         if not initial_conn_future.done():
-            final_error = connection_error or RuntimeError(f"Connection task for '{name}' ({definition.type}) ended unexpectedly.")
-            if isinstance(final_error, asyncio.CancelledError): # キャンセルで終了した場合
+            final_error = connection_error or RuntimeError(f"Connection task for '{name}' ended unexpectedly.")
+            if isinstance(final_error, asyncio.CancelledError):
                 initial_conn_future.cancel()
             else:
                 initial_conn_future.set_exception(final_error)
+            logger.warning(f"Connection future for '{name}' set to failure/cancelled as task ended.")
 
     def _mcp_tool_to_canonical(self, server_name: str, mcp_tool: types.Tool) -> CanonicalToolDefinition:
         """MCP Toolオブジェクトをカノニカル形式の辞書に変換する"""

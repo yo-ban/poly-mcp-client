@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "poly-mcp-client"
-version = "0.0.2"
+version = "0.0.3"
 description = "An MCP client adapting tool definitions for Anthropic, OpenAI, and Gemini."
 readme = "README.md"
 authors = [
