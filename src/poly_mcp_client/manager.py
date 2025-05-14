@@ -84,7 +84,7 @@ class PolyMCPClient:
         new_definitions: Dict[str, InternalServerDefinition],
         is_initialization: bool = False
     ):
-        """現在の接続状態を新しい定義に合わせて調整（開始/停止）する。"""
+        """現在の接続状態を新しい定義に合わせて調整（開始/停止/再接続）する。"""
         current_server_names = set(self._server_definitions.keys())
         new_server_names = set(new_definitions.keys())
 
@@ -93,16 +93,29 @@ class PolyMCPClient:
         servers_to_check_update = current_server_names.intersection(new_server_names)
 
         servers_to_update: Set[str] = set()
+        servers_needing_restart: Set[str] = set() # 接続が切れているが設定は残るサーバー
+
         for name in servers_to_check_update:
+            config_changed = False
             # is_initialization が True の場合、既存の定義はないので比較しない
-            # (self._server_definitions は initialize の冒頭でクリアされる想定だが念のため)
             if not is_initialization and name in self._server_definitions and self._server_definitions[name].config != new_definitions[name].config:
                 servers_to_update.add(name)
+                config_changed = True
+
+            # 設定変更がないサーバーで、接続がアクティブでないものを再起動対象とする
+            if not config_changed:
+                # セッションがないか、接続タスクが完了している場合 (接続が切れているとみなす)
+                task = self._connection_tasks.get(name)
+                if name not in self._sessions or (task and task.done()):
+                    logger.info(f"Server '{name}' config unchanged but connection is inactive. Marking for restart.")
+                    servers_needing_restart.add(name)
+
 
         context = "initialization" if is_initialization else "update"
-        logger.info(f"Connection Reconciliation ({context}) - Remove: {list(servers_to_remove)}, Add: {list(servers_to_add)}, Update: {list(servers_to_update)}")
+        logger.info(f"Connection Reconciliation ({context}) - Remove: {list(servers_to_remove)}, Add: {list(servers_to_add)}, Update: {list(servers_to_update)}, Restart (inactive): {list(servers_needing_restart)}")
 
         # --- 既存接続の停止 (削除・更新対象) ---
+        # Note: 再起動対象(servers_needing_restart)は、既に接続が切れているので停止処理は不要
         servers_to_stop = servers_to_remove.union(servers_to_update)
         if servers_to_stop:
             logger.info(f"Stopping connections for servers: {list(servers_to_stop)}")
@@ -112,29 +125,40 @@ class PolyMCPClient:
         else:
             logger.info("No servers need to be stopped.")
 
-        # --- 新規接続の開始 (追加・更新対象) ---
-        servers_to_start = servers_to_add.union(servers_to_update)
+        # --- 新規接続の開始 (追加・更新・再起動対象) ---
+        servers_to_start = servers_to_add.union(servers_to_update).union(servers_needing_restart)
         if servers_to_start:
-            logger.info(f"Starting connections for servers: {list(servers_to_start)}")
+            logger.info(f"Starting/Restarting connections for servers: {list(servers_to_start)}")
             for name in servers_to_start:
-                definition = new_definitions[name]
-                # 新しい接続 or 更新なので、新しい Future を作成または取得
-                # initialize の場合、Future は既に親の initialize で作成・クリアされている
-                # update の場合、ここで作成する
+                definition = new_definitions.get(name) # Use get() for safety
+                if not definition:
+                    logger.warning(f"Definition for server '{name}' not found in new_definitions during start phase. Skipping.")
+                    continue
+
+                # 新しい接続 or 更新 or 再起動なので、新しい Future を作成または取得
+                # 完了していないFutureを再利用しないように、完了済みの場合は常に新しいものを作成する
                 if name not in self._initial_connection_futures or self._initial_connection_futures[name].done():
                     self._initial_connection_futures[name] = asyncio.Future()
 
                 future = self._initial_connection_futures[name]
                 self._server_definitions[name] = definition # 内部定義を更新/追加
-                self._start_connection(name, definition, future) # タスク開始 (start_tasks 配列は不要)
+                # _start_connection 内で既存タスクのチェックは行われる
+                self._start_connection(name, definition, future) # タスク開始
 
-            logger.info(f"Initiated starting connections for {len(servers_to_start)} servers.")
+            logger.info(f"Initiated starting/restarting connections for {len(servers_to_start)} servers.")
         else:
-            logger.info("No new servers need to be started.")
+            logger.info("No new servers need to be started or restarted.")
 
         # --- 内部定義の最終調整 (削除されたサーバー定義を確実に消す) ---
-        # _stop_connection で定義は削除されるが、念のため新しい定義セットで上書き
-        self._server_definitions = {name: definition for name, definition in new_definitions.items()}
+        # 停止されたサーバーの定義は _stop_connection で削除される
+        # ここでは、新しい定義セットに基づいて最終的な状態を確定する
+        # （servers_to_startで追加/更新された定義は既に反映されているはず）
+        current_defs = set(self._server_definitions.keys())
+        defs_to_remove_finally = current_defs - new_server_names
+        for name_to_remove in defs_to_remove_finally:
+            self._server_definitions.pop(name_to_remove, None)
+            self._initial_connection_futures.pop(name_to_remove, None) # 関連Futureも削除
+
 
         logger.info(f"Connection reconciliation complete ({context}).")
         logger.info(f"Active server definitions: {list(self._server_definitions.keys())}")
