@@ -12,13 +12,19 @@ A simple Python client library for managing connections to MCP (Model Context Pr
 *   **Prefixed Naming:** Automatically prefixes tool names and resource URIs with `mcp-{server_name}-` (customizable). This allows handling servers that might expose tools/resources with the same original name without conflicts.
 *   **Flexible Configuration:** Define MCP servers using a JSON configuration file similar to Claude Desktop's `claude_desktop_config.json`.
 
-## Status (Version 0.0.1 - Alpha)
+## Status
+
+### Version 0.0.1
 
 *   Core functionality (tool listing, conversion, execution) is implemented.
 *   Resource listing and reading are implemented but needs further testing.
 *   SSE transport support is implemented but needs further testing.
 *   Prompt-related features are not yet implemented.
 *   This is an early alpha version. APIs might change. Use with caution.
+
+### Version 0.0.4
+*   Streamable-HTTP Transport Support (Stateless Only).
+
 
 ## Installation
 
