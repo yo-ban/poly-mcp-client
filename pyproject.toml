@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "poly-mcp-client"
-version = "0.0.3"
+version = "0.0.4"
 description = "An MCP client adapting tool definitions for Anthropic, OpenAI, and Gemini."
 readme = "README.md"
 authors = [
@@ -27,7 +27,7 @@ keywords = ["mcp", "model context protocol", "client", "manager", "ai", "llm"]
 
 # 必須の依存関係
 dependencies = [
-    "mcp == 1.6.0",
+    "mcp == 1.8.1",
     "pydantic >= 2.10.6",
 ]
 

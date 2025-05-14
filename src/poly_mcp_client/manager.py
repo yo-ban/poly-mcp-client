@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 from contextlib import AsyncExitStack
@@ -11,6 +10,7 @@ import time
 from mcp import ClientSession, StdioServerParameters, McpError
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 import mcp.types as types
 import httpx
 
@@ -18,6 +18,7 @@ from .constants import MCP_PREFIX
 from .models import (
     StdioServerConfig, 
     HttpServerConfig, 
+    StreamableHttpServerConfig,
     McpServersConfig, 
     InternalServerDefinition, 
     CanonicalToolParameter, 
@@ -601,6 +602,115 @@ class PolyMCPClient:
                         # 接続に失敗した場合 (connection_error が設定されているはず)
                         # ループの最後でリトライされる
                         pass
+                elif definition.type == "streamable-http":
+                    if not isinstance(definition.config, StreamableHttpServerConfig):
+                        logger.error(f"Invalid config type for streamable-http server: {name}")
+                        connection_error = TypeError("Invalid config type for streamable-http server.")
+                        break
+                    streamable_http_config = definition.config
+                    server_url = streamable_http_config.url
+                    logger.info(f"Attempting connection to server '{name}' (streamable-http): {server_url}")
+
+                    connection_established_in_this_loop = False
+                    try:
+                        transport_streams = await exit_stack.enter_async_context(streamablehttp_client(server_url))
+                        reader, writer, _ = transport_streams
+                        logger.info(f"Transport connection to server '{name}' (streamable-http) complete.")
+
+                        session = await exit_stack.enter_async_context(ClientSession(reader, writer))
+                        init_result = await asyncio.wait_for(session.initialize(), timeout=30.0)
+
+                        self._sessions[name] = session
+                        capabilities = init_result.capabilities
+                        self._server_capabilities[name] = capabilities
+                        logger.info(f"MCP connection to server '{name}' (streamable-http) established.")
+                        if capabilities:
+                            logger.info(f"Server '{name}' (streamable-http) capabilities: {capabilities}")
+                        
+                        connection_established_in_this_loop = True
+                        retry_delay = 5
+
+                    except httpx.RequestError as e:
+                        logger.error(f"HTTP request error during connection to server '{name}' (streamable-http): {e}")
+                        connection_error = e
+                    except httpx.HTTPStatusError as e:
+                        logger.error(f"Server '{name}' (streamable-http) returned error status: {e.response.status_code} {e.response.reason_phrase}")
+                        connection_error = e
+                    except ConnectionRefusedError as e:
+                        logger.error(f"Connection to server '{name}' (streamable-http) refused. Check URL: {server_url}")
+                        connection_error = e
+                    except asyncio.TimeoutError as e: # initialize のタイムアウト
+                        logger.error(f"Server '{name}' (streamable-http) initialization timed out.")
+                        connection_error = e
+                    except Exception as e:
+                        logger.error(f"Unexpected connection error during connection to server '{name}' (streamable-http): {e}", exc_info=False)
+                        connection_error = e
+                        break 
+
+                    if connection_established_in_this_loop and session:
+                        if initial_attempt and not initial_conn_future.done():
+                            initial_conn_future.set_result(True)
+                        initial_attempt = False
+
+                        logger.info(f"Starting keep-alive ping loop for server '{name}' (streamable-http). Interval: {PING_INTERVAL}s")
+                        last_ping_time = time.monotonic()
+
+                        while not self._is_shutting_down and name in self._sessions:
+                            current_session = self._sessions.get(name)
+                            if not current_session:
+                                logger.warning(f"Session object for '{name}' missing during ping loop.")
+                                connection_error = RuntimeError("Session object missing")
+                                break
+
+                            try:
+                                time_since_last_ping = time.monotonic() - last_ping_time
+                                wait_time = max(0, PING_INTERVAL - time_since_last_ping)
+                                logger.debug(f"[{name}] Waiting {wait_time:.1f}s for next ping...")
+
+                                sleep_task = asyncio.create_task(asyncio.sleep(wait_time))
+                                done, pending = await asyncio.wait({sleep_task}, return_when=asyncio.FIRST_COMPLETED)
+
+                                if self._is_shutting_down:
+                                    logger.info(f"Shutdown requested during ping interval for server '{name}'.")
+                                    sleep_task.cancel()
+                                    break
+                                if name not in self._sessions:
+                                    logger.warning(f"Server '{name}' removed during ping interval.")
+                                    sleep_task.cancel()
+                                    break
+
+                                logger.debug(f"Sending MCP ping to server '{name}' (streamable-http).")
+                                await asyncio.wait_for(current_session.ping(), timeout=PING_TIMEOUT)
+                                last_ping_time = time.monotonic()
+                                logger.debug(f"MCP ping to server '{name}' (streamable-http) successful.")
+
+                            except asyncio.TimeoutError:
+                                logger.warning(f"MCP ping to server '{name}' (streamable-http) timed out after {PING_TIMEOUT}s. Assuming connection lost.")
+                                connection_error = asyncio.TimeoutError("Ping timeout")
+                                break
+                            except (McpError, ConnectionError, AttributeError, httpx.TransportError) as e:
+                                logger.error(f"Error during MCP ping to server '{name}' (streamable-http): {type(e).__name__}: {e}. Assuming connection lost.", exc_info=False)
+                                connection_error = e
+                                break
+                            except asyncio.CancelledError:
+                                logger.info(f"Ping loop cancelled for server '{name}'.")
+                                connection_error = asyncio.CancelledError("Ping loop cancelled")
+                                break 
+                            except Exception as e: 
+                                logger.error(f"Unexpected error in ping loop for server '{name}': {e}", exc_info=True)
+                                connection_error = e
+                                break
+                        
+                        if self._is_shutting_down:
+                            logger.info(f"Shutdown requested. Stopping monitoring of server '{name}' (streamable-http).")
+                            break
+                        elif name not in self._sessions:
+                            logger.info(f"Server '{name}' was removed during ping loop. Stopping monitoring task.")
+                            break
+                        else:
+                            logger.warning(f"Keep-alive loop ended for server '{name}' (streamable-http). Reason: {type(connection_error).__name__ if connection_error else 'Unknown'}. Attempting reconnect.")
+                    else:
+                        pass # Connection failed, retry handled by outer loop
                 else:
                     connection_error = ValueError(f"Unknown server type: {definition.type} ({name})")
                     logger.error(connection_error)
