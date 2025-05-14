@@ -17,8 +17,15 @@ class HttpServerConfig(BaseModel):
     # 必要に応じて認証情報などを追加
 
 
+class StreamableHttpServerConfig(BaseModel):
+    """Streamable HTTPサーバー固有の設定"""
+    type: Literal["streamable-http"] = "streamable-http"
+    url: str
+    # 必要に応じて認証情報などを追加
+
+
 # Union型で Stdio または Http 設定を受け入れる
-ServerConfig = Annotated[Union[StdioServerConfig,HttpServerConfig], Field(discriminator="type")]
+ServerConfig = Annotated[Union[StdioServerConfig,HttpServerConfig,StreamableHttpServerConfig], Field(discriminator="type")]
 
 class McpServersConfig(RootModel[Dict[str, ServerConfig]]):
     root: Dict[str, ServerConfig]
@@ -33,7 +40,7 @@ class McpServersConfig(RootModel[Dict[str, ServerConfig]]):
 # --- 内部で使用するサーバー定義  ---
 class InternalServerDefinition(BaseModel):
     name: str
-    type: str  # "stdio" or "http"
+    type: str  # "stdio", "http", or "streamable-http"
     config: ServerConfig
 
 # --- カノニカル形式のツールパラメータと定義  ---
